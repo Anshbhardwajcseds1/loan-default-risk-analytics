@@ -1,0 +1,9 @@
+// Table: final_loan_risk_analysis  (import from Oracle or the exported CSV)
+Total Loans        = COUNTROWS(final_loan_risk_analysis)
+Total Exposure     = SUM(final_loan_risk_analysis[loan_amount])
+Total Defaults     = SUM(final_loan_risk_analysis[default_flag])
+Default Rate %     = DIVIDE([Total Defaults], [Total Loans], 0) * 100
+Capital at Risk    = CALCULATE(SUM(final_loan_risk_analysis[loan_amount]), final_loan_risk_analysis[default_flag] = 1)
+Loss Exposure %    = DIVIDE([Capital at Risk], [Total Exposure], 0) * 100
+Avg Interest Rate  = AVERAGE(final_loan_risk_analysis[interest_rate])
+High Risk Share %  = DIVIDE(CALCULATE([Total Loans], final_loan_risk_analysis[credit_risk_band] = "High Risk"), [Total Loans], 0) * 100

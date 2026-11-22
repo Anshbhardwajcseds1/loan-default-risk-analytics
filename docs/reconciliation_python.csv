@@ -1,0 +1,13 @@
+metric,python_value
+total_loans,32409.0
+total_defaults,7088.0
+default_rate_pct,21.87
+total_loan_amount,310882900.0
+default_loan_amount,76933675.0
+defaults_grade_A,1066.0
+defaults_grade_B,1695.0
+defaults_grade_C,1336.0
+defaults_grade_D,2137.0
+defaults_grade_E,621.0
+defaults_grade_F,170.0
+defaults_grade_G,63.0

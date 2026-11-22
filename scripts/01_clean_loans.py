@@ -1,0 +1,132 @@
+"""
+Phase 1 - Clean the raw loan file and engineer features.
+
+Input : data/raw/credit_risk_dataset.csv   (Kaggle "Credit Risk Dataset")
+Output: data/clean/loans_clean.csv         (loaded into Oracle)
+        data/clean/rejected_rows.csv       (every removed row + reason)
+        docs/data_quality_report.md        (counts for every rule)
+        docs/reconciliation_python.csv     (figures to match in Oracle and Power BI)
+
+Run from the project root:  python scripts/01_clean_loans.py
+"""
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+RAW = ROOT / "data/raw/credit_risk_dataset.csv"
+CLEAN = ROOT / "data/clean/loans_clean.csv"
+REJ = ROOT / "data/clean/rejected_rows.csv"
+DQ = ROOT / "docs/data_quality_report.md"
+REC = ROOT / "docs/reconciliation_python.csv"
+
+if not RAW.exists():
+    sys.exit(f"Missing {RAW}. Download the Kaggle file and save it there.")
+
+df = pd.read_csv(RAW)
+raw_rows = len(df)
+df.columns = [c.strip().lower() for c in df.columns]
+rename = {
+    "person_age": "age", "person_income": "income", "person_home_ownership": "home_ownership",
+    "person_emp_length": "emp_length_yrs", "loan_intent": "purpose", "loan_grade": "grade",
+    "loan_amnt": "loan_amount", "loan_int_rate": "interest_rate", "loan_status": "default_flag",
+    "loan_percent_income": "loan_percent_income_src", "cb_person_default_on_file": "prior_default",
+    "cb_person_cred_hist_length": "credit_hist_yrs",
+}
+missing = [c for c in rename if c not in df.columns]
+if missing:
+    sys.exit(f"Columns not found: {missing}. Paste your CSV headers and adjust 'rename'.")
+df = df.rename(columns=rename)
+
+log = [("Raw rows read", raw_rows, "")]
+rejected = []
+
+
+def reject(mask, reason):
+    """Move rows matching mask to the rejected list and log the count."""
+    global df
+    n = int(mask.sum())
+    if n:
+        r = df[mask].copy()
+        r["reject_reason"] = reason
+        rejected.append(r)
+    df = df[~mask].copy()
+    log.append((f"Removed: {reason}", n, "rejected_rows.csv"))
+
+
+# 1. exact duplicates (keep first)
+reject(df.duplicated(keep="first"), "exact duplicate row")
+
+# 2. target must be 0 or 1  (inconsistent status codes)
+reject(~df["default_flag"].isin([0, 1]), "invalid loan_status code (not 0/1 or missing)")
+df["default_flag"] = df["default_flag"].astype(int)
+
+# 3. income must be present and positive
+reject(df["income"].isna() | (df["income"] <= 0), "missing or non-positive income")
+
+# 4. loan amount must be positive
+reject(df["loan_amount"].isna() | (df["loan_amount"] <= 0), "missing or non-positive loan amount")
+
+# 5. impossible ages / employment lengths (dataset has 123 and 144)
+reject((df["age"] < 18) | (df["age"] > 100), "age outside 18-100")
+reject(df["emp_length_yrs"] > 60, "employment length above 60 years (source has 123)")
+
+# 6. extreme loan relative to income (flag, do not delete)
+df["extreme_loan_flag"] = (df["loan_amount"] > 5 * df["income"]).astype(int)
+
+# 7. impute interest rate with MEDIAN OF ITS GRADE; keep a flag so it stays transparent
+df["interest_rate_imputed"] = df["interest_rate"].isna().astype(int)
+df["interest_rate"] = df["interest_rate"].fillna(df.groupby("grade")["interest_rate"].transform("median"))
+df["emp_length_yrs"] = df["emp_length_yrs"].fillna(df["emp_length_yrs"].median())
+log.append(("Interest rate imputed (grade median)", int(df["interest_rate_imputed"].sum()), "flag column"))
+
+# 8. features
+df["grade"] = df["grade"].str.strip().str.upper()
+df["purpose"] = df["purpose"].str.strip().str.upper()
+df["prior_default"] = df["prior_default"].str.strip().str.upper()
+df["loan_to_income_pct"] = (df["loan_amount"] / df["income"] * 100).round(2)  # NOT true DTI: no debt data
+df["income_band"] = pd.cut(
+    df["income"], bins=[0, 30000, 60000, 100000, np.inf],
+    labels=["1. <30K", "2. 30-60K", "3. 60-100K", "4. >100K"], right=False).astype(str)
+df["age_group"] = pd.cut(
+    df["age"], bins=[17, 25, 35, 50, 100],
+    labels=["18-25", "26-35", "36-50", "51+"]).astype(str)  # (17,25] so age 18 is included
+df.insert(0, "loan_id", np.arange(1, len(df) + 1))
+df = df.drop(columns=["loan_percent_income_src"])
+
+df.to_csv(CLEAN, index=False)
+if rejected:
+    pd.concat(rejected).to_csv(REJ, index=False)
+else:
+    pd.DataFrame().to_csv(REJ, index=False)
+
+# ---------- reconciliation figures (must match Oracle + Power BI) ----------
+total = len(df)
+defaults = int(df["default_flag"].sum())
+rec = [("total_loans", total), ("total_defaults", defaults),
+       ("default_rate_pct", round(defaults / total * 100, 2)),
+       ("total_loan_amount", round(df["loan_amount"].sum(), 2)),
+       ("default_loan_amount", round(df.loc[df.default_flag == 1, "loan_amount"].sum(), 2))]
+for g, s in df.groupby("grade")["default_flag"]:
+    rec.append((f"defaults_grade_{g}", int(s.sum())))
+pd.DataFrame(rec, columns=["metric", "python_value"]).to_csv(REC, index=False)
+
+# ---------- data quality report ----------
+lines = ["# Data Quality Report", "", "Generated by `scripts/01_clean_loans.py`.", "",
+         "| Step | Rows affected | Where to see them |", "|---|---:|---|"]
+lines += [f"| {a} | {b:,} | {c} |" for a, b, c in log]
+lines += ["", f"**Clean rows loaded to Oracle:** {total:,}  ",
+          f"**Defaults:** {defaults:,} ({defaults / total * 100:.2f}%) - class imbalance noted; "
+          "accuracy is not used as a KPI, default rate and capital at risk are.  ",
+          f"**Extreme loans (loan > 5x income), kept but flagged:** {int(df['extreme_loan_flag'].sum()):,}", "",
+          "## Rules applied", "",
+          "- Duplicates: exact duplicates removed, first kept.",
+          "- Status codes: only 0 (repaid) and 1 (default) accepted.",
+          "- Income: missing, zero or negative income rejected (cannot compute loan-to-income).",
+          "- Age 18-100 and employment length <= 60 years enforced (source has ages 123/144 and employment 123).",
+          "- Interest rate: missing filled with the median of the same loan grade, flagged in `interest_rate_imputed`.",
+          "- `loan_to_income_pct` = loan_amount / income x 100. It is loan-to-income, not DTI.", ""]
+DQ.write_text("\n".join(lines), encoding="utf-8")
+print("\n".join(lines))
+print(f"\nSaved {CLEAN.name}: {total:,} rows")
